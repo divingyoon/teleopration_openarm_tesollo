@@ -1,0 +1,65 @@
+# ROS2 workspace build artifacts
+/build/
+/install/
+/log/
+
+# Data collection directories
+/bag/
+/bags/
+/dataset/
+/datasets/
+/output/
+/outputs/
+/data/
+/recordings/
+
+# Rosbag and recorded data files
+*.bag
+*.bag.active
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+*.sqlite3
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-*.log*
+
+# Local env and secrets
+.env
+.env.*
+!.env.example
+
+# Local tooling state
+.agents/
+.claude/
+.codex
+/md/everything-claude-code/
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+md/everything-claude-code
+# Local data export
+/realtime_grasp_force_log.csv
+
+# Large binaries and local SDK bundles (GitHub >100MB push failure prevention)
+/src/delto_m_ros2/USB/
+/src/openarm_teleop/follower_demo_data.csv
