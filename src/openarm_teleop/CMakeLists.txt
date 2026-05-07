@@ -25,6 +25,7 @@ endif()
 # -----------------------------
 # Find external packages
 # -----------------------------
+find_package(ament_cmake REQUIRED)
 find_package(OpenArmCAN REQUIRED)
 # find_package(urdf REQUIRED)
 find_package(orocos_kdl REQUIRED)

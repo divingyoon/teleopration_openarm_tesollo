@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from collections import deque
 from pathlib import Path
@@ -48,6 +49,24 @@ _DEFAULT_TARGET_CUP_POSE_W = np.array(
     dtype=np.float32,
 )
 
+LEFT_ARM_ROS_JOINT_NAMES = tuple(f"left_follower_arm_joint_{i}" for i in range(7))
+RIGHT_ARM_ROS_JOINT_NAMES = tuple(f"right_follower_arm_joint_{i}" for i in range(7))
+LEFT_GRIPPER_ROS_JOINT_NAME = "left_follower_hand_joint_0"
+LEFT_ARM_WITH_GRIPPER_ROS_JOINT_NAMES = LEFT_ARM_ROS_JOINT_NAMES + (LEFT_GRIPPER_ROS_JOINT_NAME,)
+RIGHT_ARM_ISAAC_JOINT_NAMES = tuple(f"openarm_right_joint{i}" for i in range(1, 8))
+LEFT_ARM_ISAAC_JOINT_NAMES = tuple(f"openarm_left_joint{i}" for i in range(1, 8))
+LEFT_GRIPPER_ISAAC_JOINT_NAMES = ("openarm_left_finger_joint1", "openarm_left_finger_joint2")
+RIGHT_HAND_JOINT_NAMES = tuple(f"rj_dg_{finger}_{joint}" for finger in range(1, 6) for joint in range(1, 5))
+EXPECTED_ROBOT_REPLAY_JOINT_NAMES = (
+    RIGHT_ARM_ISAAC_JOINT_NAMES
+    + RIGHT_HAND_JOINT_NAMES
+    + LEFT_ARM_ISAAC_JOINT_NAMES
+    + LEFT_GRIPPER_ISAAC_JOINT_NAMES
+)
+LEFT_GRIPPER_OPEN_POS = 0.044
+DEFAULT_ROBOT_URDF = Path("/home/user/rl_ws/hdgp/assets/openarm_tesollo_sensor/openarm_tesollo_sensor.urdf")
+DEFAULT_ROBOT_USD = Path("/home/user/rl_ws/hdgp/assets/openarm_tesollo_sensor/openarm_tesollo_sensor.usd")
+
 
 @dataclass
 class TopicSample:
@@ -80,6 +99,98 @@ class TfEdge:
     transform_pc: np.ndarray
 
 
+def _extract_values_by_name(
+    names: list[str],
+    values: Any,
+    expected_names: list[str] | tuple[str, ...],
+    topic_name: str,
+    field_name: str,
+) -> np.ndarray:
+    values_np = np.asarray(values, dtype=np.float32)
+    if values_np.ndim != 1:
+        values_np = values_np.reshape(-1)
+
+    if len(names) == 0:
+        if values_np.shape[0] < len(expected_names):
+            raise ValueError(
+                f"{topic_name}.{field_name} has no names and too few values: "
+                f"expected>={len(expected_names)} got={values_np.shape[0]}"
+            )
+        return values_np[: len(expected_names)].astype(np.float32)
+
+    if len(names) != values_np.shape[0]:
+        raise ValueError(
+            f"{topic_name}.{field_name} name/value length mismatch: "
+            f"names={len(names)} values={values_np.shape[0]}"
+        )
+
+    index_by_name = {name: i for i, name in enumerate(names)}
+    missing = [name for name in expected_names if name not in index_by_name]
+    if missing:
+        raise ValueError(f"{topic_name}.{field_name} missing expected joints: {missing}")
+    return np.asarray([values_np[index_by_name[name]] for name in expected_names], dtype=np.float32)
+
+
+def _extract_named_joint_pos_vel(msg, expected_names: list[str] | tuple[str, ...], topic_name: str) -> np.ndarray:
+    names = list(getattr(msg, "name", []))
+    pos = _extract_values_by_name(names, getattr(msg, "position", []), expected_names, topic_name, "position")
+
+    velocity = getattr(msg, "velocity", [])
+    if len(velocity) == 0:
+        vel = np.zeros_like(pos)
+    else:
+        vel = _extract_values_by_name(names, velocity, expected_names, topic_name, "velocity")
+    return np.concatenate([pos, vel], axis=0).astype(np.float32)
+
+
+def _extract_named_multi_dof_values(msg, expected_names: list[str] | tuple[str, ...], topic_name: str) -> np.ndarray:
+    names = list(getattr(msg, "dof_names", []))
+    return _extract_values_by_name(names, getattr(msg, "values", []), expected_names, topic_name, "values")
+
+
+def parse_urdf_joint_names(urdf_path: Path, include_fixed: bool = True) -> list[str]:
+    """Return joint names from a robot URDF, optionally excluding fixed joints."""
+
+    urdf_path = Path(urdf_path).expanduser().resolve()
+    if not urdf_path.is_file():
+        raise FileNotFoundError(f"URDF does not exist: {urdf_path}")
+
+    root = ET.parse(urdf_path).getroot()
+    names: list[str] = []
+    for joint in root.iter("joint"):
+        joint_name = joint.attrib.get("name")
+        if not joint_name:
+            continue
+        if not include_fixed and joint.attrib.get("type") == "fixed":
+            continue
+        names.append(str(joint_name))
+    return names
+
+
+def build_robot_asset_metadata(urdf_path: Path, usd_path: Path) -> dict:
+    """Validate replay joints against the URDF and return asset metadata for HDF5."""
+
+    urdf_path = Path(urdf_path).expanduser().resolve()
+    usd_path = Path(usd_path).expanduser().resolve()
+    movable_joint_names = parse_urdf_joint_names(urdf_path, include_fixed=False)
+    all_joint_names = parse_urdf_joint_names(urdf_path, include_fixed=True)
+    movable_set = set(movable_joint_names)
+    missing = [name for name in EXPECTED_ROBOT_REPLAY_JOINT_NAMES if name not in movable_set]
+    if missing:
+        raise ValueError(
+            "URDF is missing expected replay joints: "
+            f"{missing}; urdf={urdf_path}"
+        )
+
+    return {
+        "urdf_path": str(urdf_path),
+        "usd_path": str(usd_path),
+        "replay_joint_names": list(EXPECTED_ROBOT_REPLAY_JOINT_NAMES),
+        "urdf_movable_joint_names": movable_joint_names,
+        "urdf_all_joint_names": all_joint_names,
+    }
+
+
 def _build_topic_deserializer(topic_to_type: dict[str, str]) -> dict[str, Callable[[bytes], Any]]:
     try:
         from rclpy.serialization import deserialize_message
@@ -89,21 +200,6 @@ def _build_topic_deserializer(topic_to_type: dict[str, str]) -> dict[str, Callab
             "ROS deserialization dependencies missing. "
             "Run this tool in a ROS2 environment with rclpy installed."
         ) from exc
-
-    def _joint_state_pos_vel(msg) -> np.ndarray:
-        pos = np.asarray(msg.position, dtype=np.float32)
-        vel = np.asarray(msg.velocity, dtype=np.float32)
-        if vel.size == 0:
-            vel = np.zeros_like(pos)
-        elif vel.shape[0] != pos.shape[0]:
-            fixed = np.zeros_like(pos)
-            keep = min(pos.shape[0], vel.shape[0])
-            fixed[:keep] = vel[:keep]
-            vel = fixed
-        return np.concatenate([pos, vel], axis=0)
-
-    def _multi_dof_values(msg) -> np.ndarray:
-        return np.asarray(msg.values, dtype=np.float32)
 
     def _float_array(msg) -> np.ndarray:
         return np.asarray(msg.data, dtype=np.float32)
@@ -139,10 +235,18 @@ def _build_topic_deserializer(topic_to_type: dict[str, str]) -> dict[str, Callab
         return out
 
     extractors: dict[str, Callable[[object], Any]] = {
-        "/openarm/left/joint_states": _joint_state_pos_vel,
-        "/openarm/right/joint_states": _joint_state_pos_vel,
-        "/dg5f_right/rj_dg_pospid/reference": _multi_dof_values,
-        "/dg5f_right/joint_states": _joint_state_pos_vel,
+        "/openarm/left/joint_states": lambda msg: _extract_named_joint_pos_vel(
+            msg, LEFT_ARM_WITH_GRIPPER_ROS_JOINT_NAMES, "/openarm/left/joint_states"
+        ),
+        "/openarm/right/joint_states": lambda msg: _extract_named_joint_pos_vel(
+            msg, RIGHT_ARM_ROS_JOINT_NAMES, "/openarm/right/joint_states"
+        ),
+        "/dg5f_right/rj_dg_pospid/reference": lambda msg: _extract_named_multi_dof_values(
+            msg, RIGHT_HAND_JOINT_NAMES, "/dg5f_right/rj_dg_pospid/reference"
+        ),
+        "/dg5f_right/joint_states": lambda msg: _extract_named_joint_pos_vel(
+            msg, RIGHT_HAND_JOINT_NAMES, "/dg5f_right/joint_states"
+        ),
         "/tesollo/right/sensor": _float_array,
         "/tf": _tf_message,
         "/tf_static": _tf_message,
@@ -283,6 +387,24 @@ def _sensor30_to_tip_force_norm(sensor30: np.ndarray, force_max: float = 10.0) -
     force = wrench[:, :, :3]
     norm = np.linalg.norm(force, axis=2)
     return np.clip(norm / float(force_max), 0.0, 1.0).astype(np.float32)
+
+
+def _left_gripper_scalar_to_finger_pos(left_gripper_raw: np.ndarray) -> np.ndarray:
+    raw = np.asarray(left_gripper_raw, dtype=np.float32).reshape(-1, 1)
+    out = np.zeros((raw.shape[0], 2), dtype=np.float32)
+    if raw.shape[0] == 0:
+        return out
+
+    raw_min = float(np.min(raw))
+    raw_max = float(np.max(raw))
+    if abs(raw_max - raw_min) < 1e-9:
+        return out
+
+    alpha = np.clip((raw[:, 0] - raw_min) / (raw_max - raw_min), 0.0, 1.0)
+    finger = (alpha * LEFT_GRIPPER_OPEN_POS).astype(np.float32)
+    out[:, 0] = finger
+    out[:, 1] = finger
+    return out
 
 
 def _delta(x: np.ndarray) -> np.ndarray:
@@ -607,6 +729,7 @@ def build_demo(
     target_hz: int,
     object_pose_cfg: ObjectPoseConfig | None = None,
     subtask_signal_cfg: SubtaskSignalConfig | None = None,
+    right_hand_replay_source: str = "joint_state",
 ) -> dict:
     if target_hz <= 0:
         raise ValueError("target_hz must be > 0")
@@ -626,6 +749,10 @@ def build_demo(
             lift_z_margin=0.06,
             align_xy_threshold=0.08,
         )
+    if right_hand_replay_source not in {"joint_state", "reference"}:
+        raise ValueError(
+            "right_hand_replay_source must be one of: 'joint_state', 'reference'"
+        )
 
     all_start = max(topic_samples[t][0].timestamp_ns for t in REQUIRED_TOPICS)
     all_end = min(topic_samples[t][-1].timestamp_ns for t in REQUIRED_TOPICS)
@@ -638,7 +765,7 @@ def build_demo(
         raise ValueError("not enough synchronized samples after resampling")
 
     left_js = _normalize_dim(
-        _resample_nearest(topic_samples["/openarm/left/joint_states"], grid), dim=14
+        _resample_nearest(topic_samples["/openarm/left/joint_states"], grid), dim=16
     )
     right_js = _normalize_dim(
         _resample_nearest(topic_samples["/openarm/right/joint_states"], grid), dim=14
@@ -659,9 +786,14 @@ def build_demo(
     right_arm_pos = right_js[:, :7]
     right_arm_vel = right_js[:, 7:14]
     left_arm_pos = left_js[:, :7]
-    left_arm_vel = left_js[:, 7:14]
-    right_hand_pos = hand_state[:, :20]
-    right_hand_vel = hand_state[:, 20:40]
+    left_gripper_pos = _left_gripper_scalar_to_finger_pos(left_js[:, 7:8])
+    left_arm_vel = left_js[:, 8:15]
+    if right_hand_replay_source == "joint_state" and topic_samples["/dg5f_right/joint_states"]:
+        right_hand_pos = hand_state[:, :20].astype(np.float32)
+        right_hand_vel = hand_state[:, 20:40].astype(np.float32)
+    else:
+        right_hand_pos = hand_ref.astype(np.float32)
+        right_hand_vel = np.zeros_like(right_hand_pos, dtype=np.float32)
 
     right_palm_delta = _right_eef_taskspace_delta(right_arm_pos)
     right_curl = _hand_20d_to_curl_5d(hand_ref)
@@ -673,6 +805,9 @@ def build_demo(
     tip_force_norm = _sensor30_to_tip_force_norm(sensor)
     right_joint_pos = np.concatenate([right_arm_pos, right_hand_pos], axis=1).astype(np.float32)
     right_joint_vel = np.concatenate([right_arm_vel, right_hand_vel], axis=1).astype(np.float32)
+    robot_replay_joint_pos = np.concatenate(
+        [right_arm_pos, right_hand_pos, left_arm_pos, left_gripper_pos], axis=1
+    ).astype(np.float32)
 
     obs = {
         "right_joint_pos": right_joint_pos,
@@ -684,9 +819,12 @@ def build_demo(
         # Backward-compatible raw terms kept as auxiliary observations.
         "right_arm_joint_pos": right_arm_pos.astype(np.float32),
         "left_arm_joint_pos": left_arm_pos.astype(np.float32),
+        "left_gripper_joint_pos": left_gripper_pos.astype(np.float32),
         "right_hand_joint_pos": right_hand_pos.astype(np.float32),
+        "robot_replay_joint_pos": robot_replay_joint_pos,
         "right_hand_curl": right_curl.astype(np.float32),
         "tesollo_sensor": sensor.astype(np.float32),
+        "right_hand_reference_joint_pos": hand_ref.astype(np.float32),
         "datagen_info": _build_datagen_info(
             right_js=right_arm_pos,
             left_js=left_arm_pos,
@@ -755,14 +893,31 @@ def write_hdf5(
     source_bag_dirs: list[str],
     object_pose_metadata: dict | None = None,
     subtask_signal_metadata: dict | None = None,
+    right_hand_replay_metadata: dict | None = None,
+    robot_asset_metadata: dict | None = None,
 ) -> None:
+    joint_names_by_obs_key = {
+        "right_joint_pos": RIGHT_ARM_ISAAC_JOINT_NAMES + RIGHT_HAND_JOINT_NAMES,
+        "right_joint_vel": RIGHT_ARM_ISAAC_JOINT_NAMES + RIGHT_HAND_JOINT_NAMES,
+        "left_joint_pos": LEFT_ARM_ISAAC_JOINT_NAMES,
+        "left_joint_vel": LEFT_ARM_ISAAC_JOINT_NAMES,
+        "right_arm_joint_pos": RIGHT_ARM_ISAAC_JOINT_NAMES,
+        "left_arm_joint_pos": LEFT_ARM_ISAAC_JOINT_NAMES,
+        "left_gripper_joint_pos": LEFT_GRIPPER_ISAAC_JOINT_NAMES,
+        "right_hand_joint_pos": RIGHT_HAND_JOINT_NAMES,
+        "right_hand_reference_joint_pos": RIGHT_HAND_JOINT_NAMES,
+        "robot_replay_joint_pos": EXPECTED_ROBOT_REPLAY_JOINT_NAMES,
+    }
+
     def _write_obs_node(group: h5py.Group, key: str, value: dict | np.ndarray) -> None:
         if isinstance(value, dict):
             child = group.create_group(key)
             for child_key, child_value in value.items():
                 _write_obs_node(child, child_key, child_value)
             return
-        group.create_dataset(key, data=value, compression="gzip")
+        ds = group.create_dataset(key, data=value, compression="gzip")
+        if key in joint_names_by_obs_key:
+            ds.attrs["joint_names"] = json.dumps(list(joint_names_by_obs_key[key]))
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(output_file, "w") as h5:
@@ -775,6 +930,10 @@ def write_hdf5(
             data_group.attrs["object_pose_config"] = json.dumps(object_pose_metadata)
         if subtask_signal_metadata is not None:
             data_group.attrs["subtask_signal_config"] = json.dumps(subtask_signal_metadata)
+        if right_hand_replay_metadata is not None:
+            data_group.attrs["right_hand_replay_config"] = json.dumps(right_hand_replay_metadata)
+        if robot_asset_metadata is not None:
+            data_group.attrs["robot_asset_config"] = json.dumps(robot_asset_metadata)
 
         total_samples = 0
         for demo_idx, demo in enumerate(demos):
@@ -803,6 +962,9 @@ def convert_bags(
     skip_invalid_demos: bool,
     object_pose_cfg: ObjectPoseConfig,
     subtask_signal_cfg: SubtaskSignalConfig,
+    right_hand_replay_source: str,
+    robot_urdf: Path,
+    robot_usd: Path,
 ) -> tuple[int, int]:
     demos: list[dict] = []
     quality_reports: list[dict] = []
@@ -817,6 +979,7 @@ def convert_bags(
             target_hz=target_hz,
             object_pose_cfg=object_pose_cfg,
             subtask_signal_cfg=subtask_signal_cfg,
+            right_hand_replay_source=right_hand_replay_source,
         )
         try:
             validate_demo_payload(demo)
@@ -831,6 +994,7 @@ def convert_bags(
 
     if not demos:
         raise RuntimeError("no valid demos to write")
+    robot_asset_metadata = build_robot_asset_metadata(robot_urdf, robot_usd)
     write_hdf5(
         output_file=output_file,
         demos=demos,
@@ -850,6 +1014,12 @@ def convert_bags(
             "lift_z_margin": subtask_signal_cfg.lift_z_margin,
             "align_xy_threshold": subtask_signal_cfg.align_xy_threshold,
         },
+        right_hand_replay_metadata={
+            "source": right_hand_replay_source,
+            "reference_topic": "/dg5f_right/rj_dg_pospid/reference",
+            "joint_state_topic": "/dg5f_right/joint_states",
+        },
+        robot_asset_metadata=robot_asset_metadata,
     )
     return len(demos), skipped
 
@@ -881,6 +1051,25 @@ def parse_args() -> argparse.Namespace:
         "--skip-invalid-demos",
         action="store_true",
         help="Skip demos that fail shape/NaN contract instead of fail-fast.",
+    )
+    parser.add_argument(
+        "--right-hand-replay-source",
+        choices=("joint_state", "reference"),
+        default="joint_state",
+        help=(
+            "Source for obs/right_hand_joint_pos replay. "
+            "joint_state replays measured slave motion; reference replays the commanded synergy target."
+        ),
+    )
+    parser.add_argument(
+        "--robot-urdf",
+        default=str(DEFAULT_ROBOT_URDF),
+        help="URDF whose movable joint names define the robot replay contract.",
+    )
+    parser.add_argument(
+        "--robot-usd",
+        default=str(DEFAULT_ROBOT_USD),
+        help="USD asset path recorded in HDF5 metadata for IsaacLab replay/training.",
     )
     parser.add_argument(
         "--object-pose-mode",
@@ -950,11 +1139,15 @@ def main() -> int:
         skip_invalid_demos=args.skip_invalid_demos,
         object_pose_cfg=object_pose_cfg,
         subtask_signal_cfg=subtask_signal_cfg,
+        right_hand_replay_source=args.right_hand_replay_source,
+        robot_urdf=Path(args.robot_urdf),
+        robot_usd=Path(args.robot_usd),
     )
     print(
         f"[OK] converted={converted} skipped={skipped} output={output_file} "
         f"action_dim={ACTION_DIM} curl_slice={RIGHT_HAND_CURL_SLICE.start}:{RIGHT_HAND_CURL_SLICE.stop} "
-        f"object_pose_mode={object_pose_cfg.mode}"
+        f"object_pose_mode={object_pose_cfg.mode} right_hand_replay_source={args.right_hand_replay_source} "
+        f"robot_urdf={args.robot_urdf}"
     )
     return 0
 

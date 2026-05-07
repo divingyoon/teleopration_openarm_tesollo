@@ -30,6 +30,8 @@ DEFAULT_TOPICS = [
     "/tf",
     "/tf_static",
 ]
+DEFAULT_ROBOT_URDF = "/home/user/rl_ws/hdgp/assets/openarm_tesollo_sensor/openarm_tesollo_sensor.urdf"
+DEFAULT_ROBOT_USD = "/home/user/rl_ws/hdgp/assets/openarm_tesollo_sensor/openarm_tesollo_sensor.usd"
 
 
 def _run(cmd: list[str], dry_run: bool) -> int:
@@ -182,6 +184,12 @@ def _convert_hdf5(args: argparse.Namespace) -> int:
         str(args.lift_z_margin),
         "--align-xy-threshold",
         str(args.align_xy_threshold),
+        "--right-hand-replay-source",
+        str(args.right_hand_replay_source),
+        "--robot-urdf",
+        str(Path(args.robot_urdf).expanduser().resolve()),
+        "--robot-usd",
+        str(Path(args.robot_usd).expanduser().resolve()),
     ]
     if args.skip_invalid_demos:
         cmd.append("--skip-invalid-demos")
@@ -416,6 +424,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p_convert.add_argument("--grasp-curl-threshold", type=float, default=0.55)
     p_convert.add_argument("--lift-z-margin", type=float, default=0.06)
     p_convert.add_argument("--align-xy-threshold", type=float, default=0.08)
+    p_convert.add_argument(
+        "--right-hand-replay-source",
+        choices=("joint_state", "reference"),
+        default="joint_state",
+        help="Source for obs/right_hand_joint_pos replay: measured slave joint_state or commanded reference.",
+    )
+    p_convert.add_argument(
+        "--robot-urdf",
+        default=DEFAULT_ROBOT_URDF,
+        help="URDF whose movable joint names define the robot replay contract.",
+    )
+    p_convert.add_argument(
+        "--robot-usd",
+        default=DEFAULT_ROBOT_USD,
+        help="USD asset path recorded in HDF5 metadata for IsaacLab replay/training.",
+    )
     p_convert.add_argument("--skip-invalid-demos", action="store_true")
     p_convert.add_argument("--dry-run", action="store_true")
     p_convert.set_defaults(func=_convert_hdf5)

@@ -5,6 +5,41 @@
 - Required terminals: `Terminal 1` (OpenArm), `Terminal 2` (Tesollo + bridge), `Terminal 3` (bag recording).
 - ROS domain: `126`.
 
+## Build Workspace (`colcon build`)
+아래 명령은 이 저장소를 ROS 2 colcon 워크스페이스 루트로 보고 실행합니다.
+
+```bash
+cd /home/user/rl_ws/teleopration_openarm_tesollo
+
+# ROS 2 환경 로드 (사용 중인 배포판에 맞게 humble/jazzy 등을 선택)
+source /opt/ros/humble/setup.bash
+
+# 최초 1회 또는 의존성 변경 시
+rosdep update
+rosdep install --from-paths src --ignore-src -r -y
+
+# 워크스페이스 빌드
+colcon build --symlink-install
+
+# 빌드 결과 환경 로드
+source install/setup.bash
+```
+
+특정 패키지만 다시 빌드할 때:
+
+```bash
+cd /home/user/rl_ws/teleopration_openarm_tesollo
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select openarm_teleop
+source install/setup.bash
+```
+
+빌드 후 실행 터미널에서는 ROS domain도 맞춰둡니다.
+
+```bash
+export ROS_DOMAIN_ID=126
+```
+
 ## Pour V1 Mimic Pipeline (DB3 canonical)
 - Unified entrypoint: `src/openarm_teleop/script/run_pour_v1_mimic_pipeline.py`
 - Scope: **pre-pour only** (`grasp -> lift -> align`, no full pour BC in this stage)
@@ -203,7 +238,16 @@ ros2 bag info output
   - `leader_open_position=0.010490577553978753`
   - `leader_grasp_position=-1.1041809719996944`
   - `invert_input=true`
- 
+
+
+## hdf5 확인.
+```bash
+ /home/user/rl_ws/IsaacLab/isaaclab.sh -p src/openarm_teleop/script/replay_pour_hdf5_in_isaacsim.py \
+    --dataset datasets/pour_v1_test1_reconverted.hdf5 \
+    --usd /home/user/rl_ws/hdgp/assets/openarm_tesollo_sensor/openarm_tesollo_sensor.usd \
+    --loop
+```
+
 ## 테솔로 그랩 자세 관련.
   - Tesollo 디폴트 자세(포즈 20개 배열)
     src/openarm_teleop/script/tesollo_bridge_logic.py:18 의 HAND_APPROACH_POSE

@@ -1,5 +1,6 @@
 """Smoke tests for DB3->pour_v1_mimic HDF5 conversion primitives."""
 
+import json
 from pathlib import Path
 
 import h5py
@@ -8,10 +9,15 @@ import pytest
 
 from db3_to_pour_mimic_hdf5 import (
     _previous_actions,
+    _extract_named_joint_pos_vel,
+    _extract_named_multi_dof_values,
+    EXPECTED_ROBOT_REPLAY_JOINT_NAMES,
     ObjectPoseConfig,
     TfEdge,
     TopicSample,
     build_demo,
+    build_robot_asset_metadata,
+    parse_urdf_joint_names,
     run_quality_gate,
     validate_demo_payload,
     write_hdf5,
@@ -30,6 +36,94 @@ def _mk_samples(start_ns: int, step_ns: int, n: int, dim: int) -> list[TopicSamp
             )
         )
     return out
+
+
+class _Msg:
+    pass
+
+
+def test_extract_named_joint_pos_vel_reorders_and_drops_extra_gripper_joint():
+    msg = _Msg()
+    msg.name = [
+        "right_follower_arm_joint_2",
+        "right_follower_hand_joint_0",
+        "right_follower_arm_joint_0",
+        "right_follower_arm_joint_1",
+    ]
+    msg.position = [2.0, 99.0, 0.0, 1.0]
+    msg.velocity = [12.0, 199.0, 10.0, 11.0]
+
+    out = _extract_named_joint_pos_vel(
+        msg,
+        expected_names=[
+            "right_follower_arm_joint_0",
+            "right_follower_arm_joint_1",
+            "right_follower_arm_joint_2",
+        ],
+        topic_name="/openarm/right/joint_states",
+    )
+
+    np.testing.assert_array_equal(out, np.array([0.0, 1.0, 2.0, 10.0, 11.0, 12.0], dtype=np.float32))
+
+
+def test_extract_named_multi_dof_values_reorders_by_dof_names():
+    msg = _Msg()
+    msg.dof_names = ["rj_dg_1_2", "rj_dg_1_1", "rj_dg_1_4", "rj_dg_1_3"]
+    msg.values = [12.0, 11.0, 14.0, 13.0]
+
+    out = _extract_named_multi_dof_values(
+        msg,
+        expected_names=["rj_dg_1_1", "rj_dg_1_2", "rj_dg_1_3", "rj_dg_1_4"],
+        topic_name="/dg5f_right/rj_dg_pospid/reference",
+    )
+
+    np.testing.assert_array_equal(out, np.array([11.0, 12.0, 13.0, 14.0], dtype=np.float32))
+
+
+def test_build_demo_defaults_to_measured_right_hand_state_for_replay():
+    samples = {
+        "/openarm/left/joint_states": _mk_samples(0, 10_000_000, 3, 8),
+        "/openarm/right/joint_states": _mk_samples(0, 10_000_000, 3, 8),
+        "/dg5f_right/rj_dg_pospid/reference": [
+            TopicSample(i * 10_000_000, np.full((20,), 10.0 + i, dtype=np.float32))
+            for i in range(3)
+        ],
+        "/dg5f_right/joint_states": [
+            TopicSample(i * 10_000_000, np.full((40,), 100.0 + i, dtype=np.float32))
+            for i in range(3)
+        ],
+        "/tesollo/right/sensor": _mk_samples(0, 10_000_000, 3, 30),
+    }
+
+    demo = build_demo(samples, target_hz=100)
+
+    np.testing.assert_array_equal(demo["obs"]["right_hand_joint_pos"][0], np.full((20,), 100.0, dtype=np.float32))
+    np.testing.assert_array_equal(demo["obs"]["right_joint_pos"][0, 7:], np.full((20,), 100.0, dtype=np.float32))
+    np.testing.assert_array_equal(
+        demo["obs"]["right_hand_reference_joint_pos"][0],
+        np.full((20,), 10.0, dtype=np.float32),
+    )
+
+
+def test_build_demo_can_use_synergy_reference_for_right_hand_replay():
+    samples = {
+        "/openarm/left/joint_states": _mk_samples(0, 10_000_000, 3, 8),
+        "/openarm/right/joint_states": _mk_samples(0, 10_000_000, 3, 8),
+        "/dg5f_right/rj_dg_pospid/reference": [
+            TopicSample(i * 10_000_000, np.full((20,), 10.0 + i, dtype=np.float32))
+            for i in range(3)
+        ],
+        "/dg5f_right/joint_states": [
+            TopicSample(i * 10_000_000, np.full((40,), 100.0 + i, dtype=np.float32))
+            for i in range(3)
+        ],
+        "/tesollo/right/sensor": _mk_samples(0, 10_000_000, 3, 30),
+    }
+
+    demo = build_demo(samples, target_hz=100, right_hand_replay_source="reference")
+
+    np.testing.assert_array_equal(demo["obs"]["right_hand_joint_pos"][0], np.full((20,), 10.0, dtype=np.float32))
+    np.testing.assert_array_equal(demo["obs"]["right_joint_pos"][0, 7:], np.full((20,), 10.0, dtype=np.float32))
 
 
 def test_build_demo_produces_action_18d_and_valid_obs():
@@ -104,6 +198,20 @@ def test_write_hdf5_roundtrip(tmp_path):
         assert h5["data/demo_0/obs/actor_obs"][:].shape[1] == 91
         assert h5["data/demo_0/obs/right_joint_pos"][:].shape[1] == 27
         assert h5["data/demo_0/obs/right_joint_vel"][:].shape[1] == 27
+        assert h5["data/demo_0/obs/robot_replay_joint_pos"][:].shape[1] == len(EXPECTED_ROBOT_REPLAY_JOINT_NAMES)
+        right_names = json.loads(h5["data/demo_0/obs/right_joint_pos"].attrs["joint_names"])
+        robot_names = json.loads(h5["data/demo_0/obs/robot_replay_joint_pos"].attrs["joint_names"])
+        hand_names = json.loads(h5["data/demo_0/obs/right_hand_joint_pos"].attrs["joint_names"])
+        hand_reference_names = json.loads(
+            h5["data/demo_0/obs/right_hand_reference_joint_pos"].attrs["joint_names"]
+        )
+        left_gripper_names = json.loads(h5["data/demo_0/obs/left_gripper_joint_pos"].attrs["joint_names"])
+        assert right_names[:3] == ["openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3"]
+        assert robot_names == list(EXPECTED_ROBOT_REPLAY_JOINT_NAMES)
+        assert hand_names[:4] == ["rj_dg_1_1", "rj_dg_1_2", "rj_dg_1_3", "rj_dg_1_4"]
+        assert hand_reference_names == hand_names
+        assert left_gripper_names == ["openarm_left_finger_joint1", "openarm_left_finger_joint2"]
+        assert h5["data/demo_0/obs/left_gripper_joint_pos"][:].shape[1] == 2
         assert h5["data/demo_0/obs/tip_force_norm"][:].shape[1] == 5
         assert h5["data/demo_0/obs/right_hand_curl"][:].shape[1] == 5
         assert h5["data/demo_0/obs/datagen_info/eef_pose/right"][:].shape[1:] == (4, 4)
@@ -113,6 +221,41 @@ def test_write_hdf5_roundtrip(tmp_path):
         assert h5["data/demo_0/obs/datagen_info/object_pose/target_cup"][:].shape[1:] == (4, 4)
         assert h5["data/demo_0/obs/datagen_info/subtask_term_signals/align_done"][:].dtype == np.bool_
         assert h5["data/demo_0/obs/datagen_info/subtask_start_signals/pour_start"][:].dtype == np.bool_
+
+
+def test_parse_urdf_joint_names_and_robot_asset_metadata(tmp_path):
+    urdf = Path(tmp_path) / "robot.urdf"
+    fixed_joint = "world_joint"
+    urdf.write_text(
+        "<robot name='test'>"
+        f"<joint name='{fixed_joint}' type='fixed'/>"
+        + "".join(f"<joint name='{name}' type='revolute'/>" for name in EXPECTED_ROBOT_REPLAY_JOINT_NAMES)
+        + "</robot>",
+        encoding="utf-8",
+    )
+
+    assert fixed_joint in parse_urdf_joint_names(urdf, include_fixed=True)
+    assert fixed_joint not in parse_urdf_joint_names(urdf, include_fixed=False)
+
+    metadata = build_robot_asset_metadata(urdf, Path("/tmp/openarm_tesollo_sensor.usd"))
+
+    assert metadata["urdf_path"] == str(urdf)
+    assert metadata["usd_path"] == "/tmp/openarm_tesollo_sensor.usd"
+    assert metadata["replay_joint_names"] == list(EXPECTED_ROBOT_REPLAY_JOINT_NAMES)
+
+
+def test_robot_asset_metadata_fails_when_urdf_missing_replay_joint(tmp_path):
+    urdf = Path(tmp_path) / "robot.urdf"
+    names = list(EXPECTED_ROBOT_REPLAY_JOINT_NAMES)
+    urdf.write_text(
+        "<robot name='test'>"
+        + "".join(f"<joint name='{name}' type='revolute'/>" for name in names[:-1])
+        + "</robot>",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=names[-1]):
+        build_robot_asset_metadata(urdf, Path("/tmp/openarm_tesollo_sensor.usd"))
 
 
 def _nonzero_samples(n: int = 30) -> dict:

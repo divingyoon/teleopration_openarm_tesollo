@@ -106,4 +106,9 @@ class TestComputeTargetPositions:
 
     def test_alpha_one_uses_requested_index_grasp(self):
         result = compute_target_positions(1.0, Q_INITIAL, Q_GRASP)
-        assert result[4:8] == pytest.approx([0.020, 0.659, 0.628, 0.843])
+        assert result[4:8] == pytest.approx([0.0, 1.8, 1.2, 1.3])
+
+    def test_non_thumb_abduction_joints_stay_fixed_during_synergy(self):
+        result = compute_target_positions(1.0, Q_INITIAL, Q_GRASP)
+        for name in ("rj_dg_2_1", "rj_dg_3_1", "rj_dg_4_1", "rj_dg_5_1"):
+            assert result[JOINT_NAMES.index(name)] == pytest.approx(0.0)
